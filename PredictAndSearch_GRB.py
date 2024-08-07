@@ -13,7 +13,7 @@ from helper import get_a_new2
 dev_num = "7"
 TaskName = "CJ"
 # test_set = "train"
-test_set = "val"
+test_set = "test"
 DEVICE = torch.device(f"cuda:{dev_num}" if torch.cuda.is_available() else "cpu")
 
 random.seed(0)

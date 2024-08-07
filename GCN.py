@@ -132,6 +132,79 @@ class BipartiteGraphConvolution(torch_geometric.nn.MessagePassing):
         return output
 
 
+class GraphDataset_HG(torch_geometric.data.Dataset):
+    """
+    This class encodes a collection of graphs, as well as a method to load such graphs from the disk.
+    It can be used in turn by the data loaders provided by pytorch geometric.
+    """
+
+    def __init__(self, sample_files):
+        super().__init__(root=None, transform=None, pre_transform=None)
+        self.sample_files = sample_files
+
+    def len(self):
+        return len(self.sample_files)
+
+    def process_sample(self, filepath):
+        # filepath = sample_files[0]
+        GraphFilepath, solFilePath = filepath
+        with open(GraphFilepath, "rb") as f:
+            graphData = pickle.load(f)
+            # bgData = CPU_Unpickler(f).load()
+        with open(solFilePath, "rb") as f:
+            solData = pickle.load(f)
+
+        varNames = solData["var_names"]
+
+        sols = solData["sols"][:50]  # [0:300]
+        objs = solData["objs"][:50]  # [0:300]
+
+        sols = np.round(sols, 0)
+        return graphData, sols, objs, varNames
+
+    def get(self, index):
+        """
+        This method loads a node bipartite graph observation as saved on the disk during data collection.
+        """
+
+        # nbp, sols, objs, varInds, varNames = self.process_sample(self.sample_files[index])
+        graphData, sols, objs, varNames = self.process_sample(self.sample_files[index])
+        A, B, v_map, target_vars = graphData
+
+        edge_indices = torch.tensor(np.array([A.col, A.row]), dtype=torch.int32)
+        edge_attr = torch.tensor(A.data, dtype=torch.float32)
+        rhs = torch.tensor(B.todense(), dtype=torch.int32)
+
+        graph = HypergraphNodeData(edge_indices, edge_attr)
+
+        # We must tell pytorch geometric how many nodes there are, for indexing purposes
+        graph.num_nodes = len(v_map)
+        graph.rhs = torch.IntTensor(rhs)
+        graph.solutions = torch.FloatTensor(sols).reshape(-1)
+        graph.objVals = torch.FloatTensor(objs)
+        graph.nsols = sols.shape[0]
+        graph.varNames = varNames
+
+        varname_dict = {name: i for i, name in enumerate(varNames)}
+        varname_map = torch.tensor([varname_dict[v] for v in v_map])
+        graph.varInds = [[varname_map], [target_vars]]
+        return graph
+
+
+class HypergraphNodeData(torch_geometric.data.Data):
+    def __init__(self, edge_indices, edge_attr):
+        super().__init__()
+        self.edge_index = edge_indices
+        self.edge_attr = edge_attr
+
+    def __inc__(self, key, value, store, *args, **kwargs):
+        """ """
+        if key == "edge_index":
+            return torch.tensor([[self.edge_index[0].max() + 1], [self.edge_index[1].max() + 1]])
+        else:
+            return super().__inc__(key, value, *args, **kwargs)
+
+
 class GraphDataset(torch_geometric.data.Dataset):
     """
     This class encodes a collection of graphs, as well as a method to load such graphs from the disk.

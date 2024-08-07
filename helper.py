@@ -4,6 +4,7 @@ import pathlib
 import pickle
 import random
 import sys
+import time
 
 import gurobipy as gp
 import numpy as np
@@ -11,6 +12,7 @@ import pyscipopt as scp
 import torch
 import torch.nn as nn
 from gurobipy import GRB
+from scipy.sparse import coo_matrix, csr_matrix, hstack, vstack
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -465,3 +467,68 @@ def get_a_new2(ins_name):
     c_nodes = torch.clamp(c_nodes, epsilon, 1)
 
     return A, v_map, v_nodes, c_nodes, b_vars
+
+
+def get_HG_from_GRB(args, ins_name):
+    m = gp.read(ins_name)
+
+    # mapping each variable's name to index
+    mvars = m.getVars()
+    mvars.sort(key=lambda v: v.VarName)
+    v_map = {v.VarName: idx for idx, v in enumerate(mvars)}
+
+    # variables that have the specified type
+    target_vars = [idx for idx, v in enumerate(mvars) if v.VType == args.var_type]
+
+    # making all constraints to have the inequity(<=)
+    A = m.getA()
+    B = np.array(m.getAttr("RHS", m.getConstrs()))
+    sense = np.array(m.getAttr("Sense", m.getConstrs()))
+    index_ge = np.where(sense == ">")[0]
+    A[index_ge] *= -1
+    B[index_ge] *= -1
+
+    # appending the objective function to the constraints matrix
+    coef_obj = m.getAttr("Obj", mvars)
+    model_sense = m.getAttr(GRB.Attr.ModelSense)
+    if model_sense == GRB.MAXIMIZE:
+        coef_obj = np.array(coef_obj) * -1
+    A = vstack([coef_obj, A])
+    B = vstack([np.zeros([1, 1]), B.reshape([-1, 1])])
+    # C = None
+
+    # scalling all constraints by the maximum absolute coefficient in each constraint
+    # if args.scaling:
+    #     AB = hstack([A, B])
+    #     max_values = np.absolute(AB).max(axis=1).todense()
+    #     inv_max_values = 1.0 / (max_values + 1e-5)
+    #     A = A.multiply(inv_max_values)
+    # B = B.multiply(inv_max_values)
+    # C = 1.0 / (A.sum(axis=0) + 1e-5)
+    return A, B, v_map, target_vars
+
+
+# indices = torch.tensor(np.array([A.row, A.col]))
+# values = torch.tensor(A.data, dtype=torch.float64)
+# A__ = torch.sparse_coo_tensor(indices, values, size=A.shape)
+# A__.coalesce().values().shape
+# A__.coalesce().indices()
+# torch.ones(A__.coalesce().values().shape)
+
+# if args.constr_scaling:
+# DEVICE = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+# A = A.tocoo()
+# start_time = time.time()
+
+# indices = torch.tensor(np.array([A.row, A.col]))
+# data = torch.tensor(A.data, dtype=torch.float64)
+# A = torch.sparse_coo_tensor(indices, data, size=A.shape)
+
+# max_values = torch.abs(A.to_dense()).max(dim=1).values
+# max_values = torch.maximum(max_values, torch.tensor(B).abs())
+# inv_max_values = torch.diag(1 / max_values)
+
+# A = torch.sparse.mm(inv_max_values.to_sparse(), A)
+# B = torch.sparse.mm(inv_max_values.to_sparse(), torch.tensor(B).reshape([-1, 1]))
+
+# runtime = time.time() - start_time

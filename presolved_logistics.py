@@ -1,5 +1,6 @@
 import os
 import pickle
+from glob import glob
 
 import gurobipy as gp
 import numpy as np
@@ -81,3 +82,51 @@ np.mean(c_list)
 np.mean(i_list)
 
 np.mean(b_list) / (np.mean(c_list) + np.mean(i_list)) * 100
+
+
+# the number of constraints of each dataset
+task = "CJ/original"
+ins_dir = os.path.join("/mnt/disk1/thlee/MILP/pas/instance", task)
+instances = os.listdir(ins_dir)
+instances = [ins.split(".")[0] for ins in instances]
+len_dict = {}
+for comp in ["1", "2", "3"]:
+    for size in ["S", "M", "L"]:
+        len_dict[f"D{comp}{size}"] = []
+
+for ins_name in instances:
+    print(ins_name)
+    # ins_path = f"/mnt/disk1/thlee/MILP/pas/instance/CJ/original/{ins_name}.mps.gz"
+    ins_path = os.path.join(ins_dir, f"{ins_name}.mps.gz")
+
+    m = gp.read(ins_path)
+    len_dict[ins_name[:3]].append(m.numConstrs)
+
+for k, v in len_dict.items():
+    print(f"{k}: {np.mean(v)}")
+
+
+# the number of var/const of other tasks
+task = "AN/train"
+ins_dir = os.path.join("/mnt/disk1/thlee/MILP/pas/instance", task)
+instances = glob(f"{ins_dir}/*")
+instances = [i for i in instances if i.endswith(".mps.gz")]
+
+
+b_list, c_list, i_list = [], [], []
+for ins_path in instances:
+    m = gp.read(ins_path)
+    mvars = m.getVars()
+
+    var_type = [var.VType for var in mvars]
+    for t, v in zip(np.unique(var_type, return_counts=True)[0], np.unique(var_type, return_counts=True)[1]):
+        print(np.unique(var_type, return_counts=True)[0])
+        if t == "B":
+            b_list.append(v)
+        elif t == "C":
+            c_list.append(v)
+        elif t == "I":
+            i_list.append(v)
+np.mean(b_list)
+np.mean(c_list)
+np.mean(i_list)
