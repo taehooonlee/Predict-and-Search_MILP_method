@@ -1,20 +1,71 @@
 import argparse
-import os
-import pathlib
-import pickle
-import random
-import sys
-import time
 
 import gurobipy as gp
 import numpy as np
 import pyscipopt as scp
 import torch
-import torch.nn as nn
 from gurobipy import GRB
-from scipy.sparse import coo_matrix, csr_matrix, hstack, vstack
+from scipy.sparse import coo_array, vstack
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+ds2type = {"IP": "B", "WA": "B", "CJ": "I", "CJ-S": "I"}
+
+
+def create_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--exp_file_name", type=str, default="exp")
+    parser.add_argument("--exp_id", type=str, default="")
+    # data hyperparameter
+    parser.add_argument("--dir_base", type=str, default="/mnt/disk1/thlee/MILP/pas")
+    parser.add_argument("--task_name", type=str, default="IP")
+    parser.add_argument("--graph_type", type=str, default="BG")
+    parser.add_argument("--n_workers", type=int, default=4)
+    parser.add_argument("--n_sols", type=int, default=50)
+    parser.add_argument("--scaling", type=str2bool, default=True)
+    parser.add_argument("--include_obj", type=str2bool, default=True)
+    parser.add_argument("--n_rhs_features", type=int, default=2)
+    # model hyperparameter
+    parser.add_argument("--init_x", type=str, default="rhs")
+    parser.add_argument("--evi_loss", type=str2bool, default=False)
+    parser.add_argument("--bias", type=str2bool, default=True)
+    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--emb_size", type=int, default=24)
+    parser.add_argument("--n_conv", type=int, default=2)
+    parser.add_argument("--weight_l", type=str2bool, default=False)
+    parser.add_argument("--weight_r", type=str2bool, default=False)
+    parser.add_argument("--gnn_norm", type=str2bool, default=False)
+    parser.add_argument("--org_version", type=str2bool, default=True)
+    parser.add_argument("--is_lin_c", type=str2bool, default=False)
+    parser.add_argument("--activation", type=str, default="relu")
+    parser.add_argument("--negative_slope", type=float, default=0.5)
+    parser.add_argument("--lamb_edl", type=float, default=1e3)
+    parser.add_argument("--lamb_obj", type=float, default=1e3)
+    parser.add_argument("--loss_penalty", type=str, default="none")
+    parser.add_argument("--focal_gamma", type=float, default=2)
+    # training hyperparameter
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--l_rate", type=float, default=1e-3)
+    parser.add_argument("--n_epochs", type=int, default=9999)
+    args = parser.parse_args()
+    print(f"args: {args}")
+    return args
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def shrink_modulator(loss, a=10, c=0.2):
+    return 1 / (1 + torch.exp(a * (c - loss)))
 
 
 def position_get_ordered_flt(variable_features):
@@ -39,6 +90,49 @@ def position_get_ordered_flt(variable_features):
     variable_features = variable_features.to(device)
     v = torch.concat([variable_features, position_feature], dim=1)
     return v
+
+
+def get_HG_from_GRB(args, ins_name):
+    # ins_name = filepath
+    m = gp.read(ins_name)
+
+    # mapping each variable's name to index & variables that have the specified type
+    mvars = m.getVars()
+    # mvars.sort(key=lambda v: v.VarName)
+    v_map = [v.VarName for v in mvars]
+    target_vars = [idx for idx, v in enumerate(mvars) if v.VType == args.var_type]
+
+    # get coef matrix
+    A = m.getA().tocoo()
+    B = np.array(m.getAttr("RHS", m.getConstrs()))
+    sense = np.array(m.getAttr("Sense", m.getConstrs()))
+
+    # making all constraints to have the inequity(<=)
+    index_ge = np.where(sense == ">")[0]
+    sign_A = np.ones_like(B)
+    sign_A[index_ge] *= -1.0
+    B[index_ge] *= -1.0
+    B = B.reshape([-1, 1])
+    row = np.array(range(len(B)))
+    col = np.zeros_like(row)
+    sign_A = coo_array((sign_A, (row, col)), shape=(len(row), 1))
+    A = A.multiply(sign_A).tocoo()
+
+    sense = np.where(sense == "=", 0, sense)
+    sense = np.where(sense == "<", 1, sense)
+    sense = np.where(sense == ">", 1, sense)
+    # sense = np.where(sense == ">", 2, sense)
+    sense = sense.astype(float).reshape(-1, 1)
+
+    # appending the objective function to the constraints matrix
+    coef_obj = np.array(m.getAttr("Obj", mvars)).reshape(1, -1)
+    # model_sense = m.getAttr(GRB.Attr.ModelSense)
+    # if model_sense == GRB.MAXIMIZE:
+    #     coef_obj = coef_obj * -1
+    # A = vstack([coef_obj, A])
+    # B = vstack([np.zeros([1, 1]), B])
+    # return A, B, v_map, target_vars
+    return A, B, v_map, target_vars, sense, coef_obj
 
 
 def get_BG_from_scip(ins_name):
@@ -321,7 +415,7 @@ def get_BG_from_GRB(ins_name):
     return A, v_map, v_nodes, c_nodes, b_vars
 
 
-def get_a_new2(ins_name):
+def get_a_new2(args, ins_name):
     # if ins_name.split("/")[-3] == "CJ":
     #     d_num = int(ins_name.split("/")[-1].split(".")[0][-2:]) % 4
     # else:
@@ -349,13 +443,14 @@ def get_a_new2(ins_name):
 
     ori_start = 6
     emb_num = 15
-
+    # target_vars = [idx for idx, v in enumerate(mvars) if v.VType == args.var_type]
     for i in range(len(mvars)):
         tp = [0] * ori_start
         tp[3] = 0
         tp[4] = 1e20
         # tp=[0,0,0,0,0]
-        if mvars[i].vtype() == "BINARY":
+        # if mvars[i].vtype() == "BINARY":
+        if mvars[i].vtype().startswith(args.var_type):
             tp[ori_start - 1] = 1
             b_vars.append(i)
 
@@ -439,7 +534,7 @@ def get_a_new2(ins_name):
         c_nodes.append([summation / llc, llc, rhs, sense])
     v_nodes = torch.as_tensor(v_nodes, dtype=torch.float32).to(device)
     c_nodes = torch.as_tensor(c_nodes, dtype=torch.float32).to(device)
-    b_vars = torch.as_tensor(b_vars, dtype=torch.int32).to(device)
+    # b_vars = torch.as_tensor(b_vars, dtype=torch.int32).to(device)
 
     A = torch.sparse_coo_tensor(indices_spr, values_spr, (ncons + 1, nvars)).to(device)
     clip_max = [20000, 1, torch.max(v_nodes, 0)[0][2].item()]
@@ -467,68 +562,3 @@ def get_a_new2(ins_name):
     c_nodes = torch.clamp(c_nodes, epsilon, 1)
 
     return A, v_map, v_nodes, c_nodes, b_vars
-
-
-def get_HG_from_GRB(args, ins_name):
-    m = gp.read(ins_name)
-
-    # mapping each variable's name to index
-    mvars = m.getVars()
-    mvars.sort(key=lambda v: v.VarName)
-    v_map = {v.VarName: idx for idx, v in enumerate(mvars)}
-
-    # variables that have the specified type
-    target_vars = [idx for idx, v in enumerate(mvars) if v.VType == args.var_type]
-
-    # making all constraints to have the inequity(<=)
-    A = m.getA()
-    B = np.array(m.getAttr("RHS", m.getConstrs()))
-    sense = np.array(m.getAttr("Sense", m.getConstrs()))
-    index_ge = np.where(sense == ">")[0]
-    A[index_ge] *= -1
-    B[index_ge] *= -1
-
-    # appending the objective function to the constraints matrix
-    coef_obj = m.getAttr("Obj", mvars)
-    model_sense = m.getAttr(GRB.Attr.ModelSense)
-    if model_sense == GRB.MAXIMIZE:
-        coef_obj = np.array(coef_obj) * -1
-    A = vstack([coef_obj, A])
-    B = vstack([np.zeros([1, 1]), B.reshape([-1, 1])])
-    # C = None
-
-    # scalling all constraints by the maximum absolute coefficient in each constraint
-    # if args.scaling:
-    #     AB = hstack([A, B])
-    #     max_values = np.absolute(AB).max(axis=1).todense()
-    #     inv_max_values = 1.0 / (max_values + 1e-5)
-    #     A = A.multiply(inv_max_values)
-    # B = B.multiply(inv_max_values)
-    # C = 1.0 / (A.sum(axis=0) + 1e-5)
-    return A, B, v_map, target_vars
-
-
-# indices = torch.tensor(np.array([A.row, A.col]))
-# values = torch.tensor(A.data, dtype=torch.float64)
-# A__ = torch.sparse_coo_tensor(indices, values, size=A.shape)
-# A__.coalesce().values().shape
-# A__.coalesce().indices()
-# torch.ones(A__.coalesce().values().shape)
-
-# if args.constr_scaling:
-# DEVICE = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-# A = A.tocoo()
-# start_time = time.time()
-
-# indices = torch.tensor(np.array([A.row, A.col]))
-# data = torch.tensor(A.data, dtype=torch.float64)
-# A = torch.sparse_coo_tensor(indices, data, size=A.shape)
-
-# max_values = torch.abs(A.to_dense()).max(dim=1).values
-# max_values = torch.maximum(max_values, torch.tensor(B).abs())
-# inv_max_values = torch.diag(1 / max_values)
-
-# A = torch.sparse.mm(inv_max_values.to_sparse(), A)
-# B = torch.sparse.mm(inv_max_values.to_sparse(), torch.tensor(B).reshape([-1, 1]))
-
-# runtime = time.time() - start_time
